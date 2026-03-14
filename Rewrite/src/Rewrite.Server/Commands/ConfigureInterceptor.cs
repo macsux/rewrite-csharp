@@ -15,7 +15,7 @@ public class ConfigureInterceptor(HostApplicationBuilder builder) : ICommandInte
     public void Intercept(CommandContext context, CommandSettings settings)
     { 
         var commonSettings = (BaseSettings)settings;
-        Logging.ConfigureLogging(commonSettings.LogFilePath);
+        Logging.ConfigureLogging(commonSettings.LogFilePath, minimumLevel: commonSettings.Verbosity);
         builder.Logging.ClearProviders();
         builder.Logging.AddSerilog();
         builder.Configuration

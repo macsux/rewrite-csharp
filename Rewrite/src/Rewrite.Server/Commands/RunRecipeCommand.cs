@@ -1,7 +1,11 @@
 ﻿using System.ComponentModel;
 using System.Reflection;
+using System.Text;
 using System.Text.RegularExpressions;
 // using Microsoft.Build.Exceptions;
+using DiffPlex;
+using DiffPlex.DiffBuilder;
+using DiffPlex.DiffBuilder.Model;
 using Microsoft.Extensions.Logging;
 using NuGet.Configuration;
 using NuGet.LibraryModel;
@@ -51,6 +55,16 @@ public class RunRecipeCommand(RecipeManager recipeManager, ILogger<RunRecipeComm
         [Description("Does not commit changes to disk")]
         public bool DryRun { get; set; } = false;
 
+        [CommandOption("--gitpatch <PATH>")]
+        [Description("Generate a git-style unified diff patch at the specified path instead of modifying source files. Implies --dry-run. " +
+                     "When mode is 'combined', this is a file path. When mode is 'recipe', this is a directory where per-recipe patch files are written")]
+        public string? GitPatchPath { get; set; }
+
+        [CommandOption("--gitpatch-mode <MODE>")]
+        [Description("Patch generation mode. 'combined' (default) merges all changes into a single patch file. " +
+                     "'recipe' generates a separate patch file per recipe ID (e.g. MA0008.patch) in the directory specified by --gitpatch")]
+        public GitPatchMode GitPatchMode { get; set; } = GitPatchMode.Combined;
+
         [CommandOption("-i|--id <VERSION>")]
         [Description("Recipe IDs. For Open Rewrite recipes this is namespace qualified type name. For Roslyn recipies this is the diagnostic ID (ex. CS1123). This parameter can be specified multiple times. " +
                      "If ommited, every fixable issue in the package will be applied.")]
@@ -91,7 +105,12 @@ public class RunRecipeCommand(RecipeManager recipeManager, ILogger<RunRecipeComm
     
     public override async Task<int> ExecuteAsync(CommandContext context, Settings settings, CancellationToken cancellationToken)
     {
-        logger.LogInformation("Executing {CommandName} with settings {@Settings}", nameof(RunRecipeCommand), settings);
+        if (settings.GitPatchPath != null)
+        {
+            settings.DryRun = true;
+        }
+
+        logger.LogDebug("Executing {CommandName} with settings {@Settings}", nameof(RunRecipeCommand), settings);
         // var recipeManager = new RecipeManager();
         // CA1802: Use Literals Where Appropriate
         // CA1861: Avoid constant arrays as arguments
@@ -116,13 +135,14 @@ public class RunRecipeCommand(RecipeManager recipeManager, ILogger<RunRecipeComm
         var analyzerIds = settings.Ids.Where(x => x.EndsWith(":A")).Select(x => Regex.Replace(x,":A$", "")).ToHashSet();
         var allOtherIds = settings.Ids.Where(x => !x.EndsWith(":A")).Select(x => Regex.Replace(x,":A$", "")).ToHashSet();
 
+        List<RecipeExecutionResult> allResults = [];
         foreach (var solutionPath in solutionPaths)
         {
             var recipeStartInfos = recipeExecutionContext.Recipes
                 .Where(x =>
                 {
                     if(settings.Ids.Length == 0)
-                        return false;
+                        return true;
                     if (analyzerIds.Contains(x.Id))
                         return x.Kind == RecipeKind.RoslynAnalyzer;
                     return allOtherIds.Contains(x.Id);
@@ -140,23 +160,116 @@ public class RunRecipeCommand(RecipeManager recipeManager, ILogger<RunRecipeComm
             try
             {
                 var recipeResult = await recipe.Execute(CancellationToken.None);
-                foreach (var issue in recipeResult.FixedIssues)
-                {
-                    // logger.LogInformation("Issue {IssueId} fixes: {@FileName}", issue.IssueId, issue.Fixes
-                    //     .SelectMany(x => x.LineNumbers.Select(lineNum => $"{x.FileName}:{lineNum}"))
-                    //     .OrderBy(x => x)
-                    // );
-                }
+                allResults.Add(recipeResult);
             }
             catch (Exception ex)
             {
                 logger.LogWarning(ex, "Error running recipe in {Solution} due to {Error}", solutionPath, ex.Message);
                 continue;
             }
-            
-            
+        }
+
+        if (settings.GitPatchPath != null)
+        {
+            await WritePatchOutput(settings, allResults, cancellationToken);
         }
 
         return 0;
     }
+
+    private async Task WritePatchOutput(Settings settings, List<RecipeExecutionResult> results, CancellationToken cancellationToken)
+    {
+        switch (settings.GitPatchMode)
+        {
+            case GitPatchMode.Combined:
+            {
+                var allDiffs = results.SelectMany(r => r.ChangedDocuments).ToList();
+                if (allDiffs.Count == 0) break;
+                var patch = GenerateGitPatch(allDiffs);
+                var patchDir = Path.GetDirectoryName(settings.GitPatchPath!);
+                if (patchDir != null && !Directory.Exists(patchDir))
+                    Directory.CreateDirectory(patchDir);
+                await File.WriteAllTextAsync(settings.GitPatchPath!, patch, cancellationToken);
+                logger.LogInformation("Patch written to {PatchPath} ({FileCount} files changed)", settings.GitPatchPath, allDiffs.Count);
+                break;
+            }
+            case GitPatchMode.Recipe:
+            {
+                var outputDir = settings.GitPatchPath!;
+                if (!Directory.Exists(outputDir))
+                    Directory.CreateDirectory(outputDir);
+                var issuesWithDiffs = results
+                    .SelectMany(r => r.FixedIssues)
+                    .Where(i => i.Diffs.Count > 0)
+                    .ToList();
+                foreach (var issue in issuesWithDiffs)
+                {
+                    var patch = GenerateGitPatch(issue.Diffs);
+                    var patchFile = Path.Combine(outputDir, $"{issue.IssueId}.patch");
+                    await File.WriteAllTextAsync(patchFile, patch, cancellationToken);
+                    logger.LogInformation("Patch written to {PatchPath} ({FileCount} files changed)", patchFile, issue.Diffs.Count);
+                }
+                if (issuesWithDiffs.Count == 0)
+                    logger.LogInformation("No patches generated - no fixable issues found");
+                else
+                    logger.LogInformation("Generated {Count} patch file(s) in {Directory}", issuesWithDiffs.Count, outputDir);
+                break;
+            }
+        }
+    }
+
+    private static string GenerateGitPatch(List<DocumentDiff> diffs)
+    {
+        var sb = new StringBuilder();
+        var differ = new Differ();
+
+        foreach (var diff in diffs)
+        {
+            var filePath = diff.FilePath.Replace('\\', '/');
+            sb.AppendLine($"diff --git a/{filePath} b/{filePath}");
+            sb.AppendLine($"--- a/{filePath}");
+            sb.AppendLine($"+++ b/{filePath}");
+
+            var oldLines = diff.OldText.Split('\n');
+            var newLines = diff.NewText.Split('\n');
+            var result = differ.CreateLineDiffs(diff.OldText, diff.NewText, ignoreWhitespace: false);
+
+            foreach (var diffBlock in result.DiffBlocks)
+            {
+                var contextLines = 3;
+                var oldStart = Math.Max(0, diffBlock.InsertStartB - contextLines);
+                var deleteEnd = diffBlock.DeleteStartA + diffBlock.DeleteCountA;
+                var insertEnd = diffBlock.InsertStartB + diffBlock.InsertCountB;
+                var oldEnd = Math.Min(oldLines.Length, deleteEnd + contextLines);
+                var newEnd = Math.Min(newLines.Length, insertEnd + contextLines);
+
+                var hunkOldStart = oldStart + 1;
+                var hunkOldCount = oldEnd - oldStart;
+                var hunkNewStart = oldStart + 1;
+                var hunkNewCount = (oldEnd - oldStart) - diffBlock.DeleteCountA + diffBlock.InsertCountB;
+
+                sb.AppendLine($"@@ -{hunkOldStart},{hunkOldCount} +{hunkNewStart},{hunkNewCount} @@");
+
+                for (var i = oldStart; i < diffBlock.DeleteStartA; i++)
+                    sb.AppendLine($" {oldLines[i]}");
+
+                for (var i = diffBlock.DeleteStartA; i < deleteEnd; i++)
+                    sb.AppendLine($"-{oldLines[i]}");
+
+                for (var i = diffBlock.InsertStartB; i < insertEnd; i++)
+                    sb.AppendLine($"+{newLines[i]}");
+
+                for (var i = deleteEnd; i < oldEnd; i++)
+                    sb.AppendLine($" {oldLines[i]}");
+            }
+        }
+
+        return sb.ToString();
+    }
+}
+
+public enum GitPatchMode
+{
+    Combined,
+    Recipe
 }

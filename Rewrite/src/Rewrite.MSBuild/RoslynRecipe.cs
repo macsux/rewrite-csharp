@@ -102,7 +102,7 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
         if (analyzersWithFixersById.Count == 0)
         {
             log.LogError("No analyzers targeting issue {DiagnosticIds} has been found", DiagnosticIdsToFix);
-            return new RecipeExecutionResult(SolutionFilePath, TimeSpan.Zero, TimeSpan.Zero, []);
+            return new RecipeExecutionResult(SolutionFilePath, TimeSpan.Zero, TimeSpan.Zero, [], []);
         }
         
         Stopwatch watch = new();
@@ -128,7 +128,7 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
         if (diagnosticsForSelectedIds.Count == 0)
         {
             log.LogDebug("No issues found in solution");
-            return new RecipeExecutionResult(SolutionFilePath, TimeSpan.MinValue,TimeSpan.MinValue, []);
+            return new RecipeExecutionResult(SolutionFilePath, TimeSpan.MinValue, TimeSpan.MinValue, [], []);
         }
         
 
@@ -155,6 +155,8 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
         
         await ApplyAnalyzerHighlights(analyzersToHighlight, solution, cancellationToken);
         
+        var changedDocuments = await GetChangedDocumentDiffs(solution, cancellationToken);
+
         if (!DryRun)
         {
             workspace.TryApplyChanges(solution.CurrentSolution);
@@ -162,7 +164,7 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
 
         watch.Stop();
         log.LogDebug("Executed recipes in {Elapsed}", watch.Elapsed);
-        var recipeExecutionResult = new RecipeExecutionResult(SolutionFilePath, solutionLoadTime,watch.Elapsed, fixedIssues);
+        var recipeExecutionResult = new RecipeExecutionResult(SolutionFilePath, solutionLoadTime, watch.Elapsed, fixedIssues, changedDocuments);
         return recipeExecutionResult;
     }
 
@@ -170,7 +172,7 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
     {
         if (analyzersToHighlight.Count == 0)
             return;
-        var diagnostics = await GetDiagnostics(solution, analyzersToHighlight.Values.ToImmutableArray(), cancellationToken);
+        var diagnostics = await GetDiagnostics(solution, analyzersToHighlight.Values.Distinct().ToImmutableArray(), cancellationToken);
         var diagnosticsByDocument = diagnostics
             .Select(x => (Diagnostic: x, Document: solution.CurrentSolution.GetDocument(x.Location.SourceTree)))
             .Where(x => x.Document != null)
@@ -180,32 +182,32 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
 
         foreach (var (document, currentDocumentDiagnostics) in diagnosticsByDocument)
         {
-            var editor = await DocumentEditor.CreateAsync(document, cancellationToken);
-            var root = editor.OriginalRoot;
+            var root = await document.GetSyntaxRootAsync(cancellationToken);
+            if (root == null) continue;
 
-            // Group diagnostics by their target node to handle multiple diagnostics on the same node
-            var diagnosticsByNode = currentDocumentDiagnostics
-                .Select(d => (Diagnostic: d, Node: root.FindNode(d.Location.SourceSpan)))
-                .GroupBy(x => x.Node, x => x.Diagnostic)
+            // Group diagnostics by their target node span to handle multiple diagnostics on the same node
+            var diagnosticsBySpan = currentDocumentDiagnostics
+                .GroupBy(d => d.Location.SourceSpan)
                 .ToDictionary(g => g.Key, g => g.ToList());
 
-            foreach (var (node, nodeDiagnostics) in diagnosticsByNode)
-            {
-                // Build the highlight comments for all diagnostics on this node
-                var highlightComments = nodeDiagnostics
-                    .Select(d => SyntaxFactory.Comment($"/* >> {d.Id} */"))
-                    .Concat([SyntaxFactory.Space])
-                    .ToList();
+            var newRoot = root.ReplaceNodes(
+                diagnosticsBySpan.Keys.Select(span => root.FindNode(span)),
+                (originalNode, _) =>
+                {
+                    if (!diagnosticsBySpan.TryGetValue(originalNode.Span, out var nodeDiagnostics))
+                        return originalNode;
 
-                // Prepend the highlight comments to the node's existing leading trivia
-                var existingTrivia = node.GetLeadingTrivia();
-                var newTrivia = SyntaxFactory.TriviaList(highlightComments.Concat(existingTrivia));
-                var newNode = node.WithLeadingTrivia(newTrivia);
+                    var highlightComments = nodeDiagnostics
+                        .Select(d => SyntaxFactory.Comment($"/* >> {d.Id} */"))
+                        .Concat([SyntaxFactory.Space])
+                        .ToList();
 
-                editor.ReplaceNode(node, newNode);
-            }
+                    var existingTrivia = originalNode.GetLeadingTrivia();
+                    var newTrivia = SyntaxFactory.TriviaList(highlightComments.Concat(existingTrivia));
+                    return originalNode.WithLeadingTrivia(newTrivia);
+                });
 
-            solution.CurrentSolution = editor.GetChangedDocument().Project.Solution;
+            solution.CurrentSolution = document.WithSyntaxRoot(newRoot).Project.Solution;
         }
     }
 
@@ -300,12 +302,22 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
             Solution newSolution;
             try
             {
-                var codeAction = await fixAllProvider.GetFixAsync(fixAllContext) ?? throw new Exception("Code action was not found");
+                var codeAction = await fixAllProvider.GetFixAsync(fixAllContext);
+                if (codeAction == null)
+                {
+                    log.LogDebug("Skipping {IssueId}: FixAllProvider returned no bulk fix (individual fixes may exist but bulk application is not supported)", issueId);
+                    continue;
+                }
                 var operations = await codeAction.GetOperationsAsync(cancellationToken);
-                var applyChangesOperation = operations.OfType<ApplyChangesOperation>().First();
+                var applyChangesOperation = operations.OfType<ApplyChangesOperation>().FirstOrDefault();
+                if (applyChangesOperation == null)
+                {
+                    log.LogDebug("Skipping {IssueId}: code action produced no ApplyChangesOperation", issueId);
+                    continue;
+                }
                 newSolution = applyChangesOperation.ChangedSolution;
             }
-            catch (Exception e) 
+            catch (Exception e)
             {
                 log.LogError(e, "Unable to apply {IssueId} due to internal CodeFixup logic error", issueId);
                 continue;
@@ -328,17 +340,20 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
             //     Console.WriteLine(diffs);
             // }
             
+            var solutionBeforeFix = solution.CurrentSolution;
             solution.CurrentSolution = newSolution;
             var affectedDocumentIds = await GetChangedDocumentsAsync(solution, cancellationToken);
             var affectedDocuments = affectedDocumentIds
                 .Select(x => (Document: solution.CurrentSolution.GetDocument(x.DocumentId)!, x.ChangedLineNumbers))
                 .ToList();
+            var issueDiffs = await GetDocumentDiffsBetween(solutionBeforeFix, newSolution, cancellationToken);
             var issueFixResult = new IssueFixResult(
-                IssueId: issueId, 
-                ExecutionTime: recipeWatch.Elapsed, 
+                IssueId: issueId,
+                ExecutionTime: recipeWatch.Elapsed,
                 Fixes: affectedDocuments
                     .Select(x => new DocumentFixResult(x.Document.FilePath!, x.ChangedLineNumbers))
-                    .ToList());
+                    .ToList(),
+                Diffs: issueDiffs);
             fixedIssues.Add(issueFixResult);
             recipeWatch.Stop();
             
@@ -407,6 +422,77 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
         return changedDocumentIds;
     }
     
+    private static async Task<List<DocumentDiff>> GetChangedDocumentDiffs(
+        SolutionEditor solution,
+        CancellationToken cancellationToken)
+    {
+        var diffs = new List<DocumentDiff>();
+
+        foreach (var projectId in solution.CurrentSolution.ProjectIds)
+        {
+            var oldProject = solution.OriginalSolution.GetProject(projectId);
+            var newProject = solution.CurrentSolution.GetProject(projectId);
+
+            if (oldProject == null || newProject == null)
+                continue;
+
+            foreach (var documentId in newProject.DocumentIds)
+            {
+                var oldDoc = oldProject.GetDocument(documentId);
+                var newDoc = newProject.GetDocument(documentId);
+
+                if (oldDoc == null || newDoc == null)
+                    continue;
+
+                var oldText = await oldDoc.GetTextAsync(cancellationToken);
+                var newText = await newDoc.GetTextAsync(cancellationToken);
+
+                if (!oldText.ContentEquals(newText) && newDoc.FilePath != null)
+                {
+                    diffs.Add(new DocumentDiff(newDoc.FilePath, oldText.ToString(), newText.ToString()));
+                }
+            }
+        }
+
+        return diffs;
+    }
+
+    private static async Task<List<DocumentDiff>> GetDocumentDiffsBetween(
+        Solution oldSolution,
+        Solution newSolution,
+        CancellationToken cancellationToken)
+    {
+        var diffs = new List<DocumentDiff>();
+
+        foreach (var projectId in newSolution.ProjectIds)
+        {
+            var oldProject = oldSolution.GetProject(projectId);
+            var newProject = newSolution.GetProject(projectId);
+
+            if (oldProject == null || newProject == null)
+                continue;
+
+            foreach (var documentId in newProject.DocumentIds)
+            {
+                var oldDoc = oldProject.GetDocument(documentId);
+                var newDoc = newProject.GetDocument(documentId);
+
+                if (oldDoc == null || newDoc == null)
+                    continue;
+
+                var oldText = await oldDoc.GetTextAsync(cancellationToken);
+                var newText = await newDoc.GetTextAsync(cancellationToken);
+
+                if (!oldText.ContentEquals(newText) && newDoc.FilePath != null)
+                {
+                    diffs.Add(new DocumentDiff(newDoc.FilePath, oldText.ToString(), newText.ToString()));
+                }
+            }
+        }
+
+        return diffs;
+    }
+
     /// <summary>
     /// Used to track solution changes as it's updated between recipe executions.
     /// Doing it this way allows us to use it cleanly in lambdas so closures point to the most recent state, not when closure was made

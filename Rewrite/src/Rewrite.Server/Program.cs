@@ -19,6 +19,7 @@ commandApp.Configure(c =>
 {
     c.AddCommand<NoOpCommand<LanguageServerCommand.Settings>>("server");
     c.AddCommand<NoOpCommand<RunRecipeCommand.Settings>>("run-recipe");
+    c.AddCommand<NoOpCommand<ListRecipesCommand.Settings>>("list-recipes");
     c.SetInterceptor(new ConfigureInterceptor(builder));
 });
 var result = await commandApp.RunAsync(args);
@@ -35,6 +36,7 @@ commandApp.Configure(c =>
 {
     c.AddCommand<LanguageServerCommand>("server");
     c.AddCommand<RunRecipeCommand>("run-recipe");
+    c.AddCommand<ListRecipesCommand>("list-recipes");
     c.SetExceptionHandler((ex, resolver) =>
     {
         AnsiConsole.WriteException(ex, ExceptionFormats.ShortenEverything);

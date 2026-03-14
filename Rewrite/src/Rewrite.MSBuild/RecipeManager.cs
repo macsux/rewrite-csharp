@@ -181,7 +181,7 @@ public class RecipeManager
         var requiredAssemblies = GetRequiredAssemblies(lockFile, _nugetSettings);
         
         var recipeExecutionContext = new RecipeExecutionContext(requiredAssemblies.Select(x => x.AssemblyPath).ToList(), _loggerFactory);
-        _log.LogInformation("{@Recipes}", recipeExecutionContext.Recipes.Select(x => new {x.Id, x.TypeName, x.DisplayName}));
+        _log.LogDebug("{@Recipes}", recipeExecutionContext.Recipes.Select(x => new {x.Id, x.TypeName, x.DisplayName}));
         return recipeExecutionContext;
 
     }

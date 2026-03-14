@@ -20,15 +20,15 @@ public class NugetLogger : NuGet.Common.ILogger
 
     public void LogVerbose(string data) => _log.LogDebug(data);
 
-    public void LogInformation(string data) => _log.LogInformation(data);
+    public void LogInformation(string data) => _log.LogDebug(data);
 
-    public void LogMinimal(string data) => _log.LogInformation(data);
+    public void LogMinimal(string data) => _log.LogDebug(data);
 
     public void LogWarning(string data) => _log.LogWarning(data);
 
     public void LogError(string data) => _log.LogError(data);
 
-    public void LogInformationSummary(string data) => _log.LogInformation(data);
+    public void LogInformationSummary(string data) => _log.LogDebug(data);
 
     public void Log(LogLevel level, string data)
     {
@@ -40,7 +40,7 @@ public class NugetLogger : NuGet.Common.ILogger
                 break;
             case LogLevel.Information:
             case LogLevel.Minimal:
-                _log.LogInformation(data);
+                _log.LogDebug(data);
                 break;
             case LogLevel.Warning:
                 _log.LogWarning(data);
