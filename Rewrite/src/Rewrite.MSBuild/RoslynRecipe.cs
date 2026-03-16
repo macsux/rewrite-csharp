@@ -96,8 +96,8 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
             .LeftJoin(fixers, x => x.Id, x => x.Key, (a, b) => (a.Id, a.Analyzer, Fixer: b.Value))
             .Where(x => userSelectedDiagnosticIds.Contains(x.Id))
             .GroupBy(x => x.Id)
-            .Select(x => (x.Key, x.First().Analyzer, x.FirstOrDefault().Fixer))
-            .ToDictionary(x => x.Key, x => (x.Analyzer, x.Fixer));
+            .Select(x => (x.Key, Analyzers: x.Select(a => a.Analyzer).Distinct().ToImmutableArray(), x.FirstOrDefault().Fixer))
+            .ToDictionary(x => x.Key, x => (x.Analyzers, x.Fixer));
         
         if (analyzersWithFixersById.Count == 0)
         {
@@ -116,7 +116,7 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
         var solution = new SolutionEditor(originalSolution);
         
         var analyzersToApply = analyzersWithFixersById
-            .Select(x => x.Value.Analyzer)
+            .SelectMany(x => x.Value.Analyzers)
             .Distinct()
             .ToImmutableArray();
         
@@ -150,8 +150,7 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
 
         var analyzersToHighlight = analyzersWithFixersById
             .Where(x => reportableDiagnosticsIds.Contains(x.Key))
-            
-            .ToDictionary(x => x.Key, x => x.Value.Analyzer);
+            .ToDictionary(x => x.Key, x => x.Value.Analyzers);
         
         await ApplyAnalyzerHighlights(analyzersToHighlight, solution, cancellationToken);
         
@@ -168,11 +167,11 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
         return recipeExecutionResult;
     }
 
-    private async Task ApplyAnalyzerHighlights(Dictionary<string, DiagnosticAnalyzer> analyzersToHighlight, SolutionEditor solution, CancellationToken cancellationToken)
+    private async Task ApplyAnalyzerHighlights(Dictionary<string, ImmutableArray<DiagnosticAnalyzer>> analyzersToHighlight, SolutionEditor solution, CancellationToken cancellationToken)
     {
         if (analyzersToHighlight.Count == 0)
             return;
-        var diagnostics = await GetDiagnostics(solution, analyzersToHighlight.Values.Distinct().ToImmutableArray(), cancellationToken);
+        var diagnostics = await GetDiagnostics(solution, analyzersToHighlight.Values.SelectMany(x => x).Distinct().ToImmutableArray(), cancellationToken);
         var diagnosticsByDocument = diagnostics
             .Select(x => (Diagnostic: x, Document: solution.CurrentSolution.GetDocument(x.Location.SourceTree)))
             .Where(x => x.Document != null)
@@ -212,15 +211,15 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
     }
 
     private async Task<List<IssueFixResult>> ApplyCodeFixers(
-        Dictionary<string, (DiagnosticAnalyzer Analyzer, CodeFixProvider Fixer)> fixesToApply, 
+        Dictionary<string, (ImmutableArray<DiagnosticAnalyzer> Analyzers, CodeFixProvider Fixer)> fixesToApply,
         SolutionEditor solution,
          CancellationToken cancellationToken)
     {
         List<IssueFixResult> fixedIssues = new();
-        foreach (var (issueId, (analyzer, codeFixProvider)) in fixesToApply)
+        foreach (var (issueId, (analyzers, codeFixProvider)) in fixesToApply)
         {
             var recipeWatch = Stopwatch.StartNew();
-            var diagnostics = await GetDiagnostics(solution, [analyzer], cancellationToken);
+            var diagnostics = await GetDiagnostics(solution, analyzers, cancellationToken);
             diagnostics = diagnostics
                 .Where(x => x.Id == issueId)
                 .ToList();
@@ -279,8 +278,8 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
             if (sampledDiagnostic == null)
             {
                 // generally we end up here when an analyzer has a fixer associated with it, but fixer determined that it can't actually fix it automatically (didn't register any code actions)
-                log.LogDebug("No fixable issues found in solution");
-                break;
+                log.LogWarning("Skipping {IssueId}: no fixable occurrence found (fixer did not register any code actions for {Count} diagnostics)", issueId, diagnostics.Count);
+                continue;
             }
 
             log.LogDebug("Fixing {DiagnosticId}: '{Title}' using {TypeName} in {DocumentCount} documents ({OccurrenceCount} occurrences)",
@@ -363,14 +362,14 @@ public class RoslynRecipe(IEnumerable<Assembly> recipeAssemblies, ILogger<Roslyn
     }
 
     private async Task<List<Diagnostic>> GetDiagnostics(
-        SolutionEditor solution, 
-        ImmutableArray<DiagnosticAnalyzer> analyzers, 
+        SolutionEditor solution,
+        ImmutableArray<DiagnosticAnalyzer> analyzers,
         CancellationToken cancellationToken)
     {
-        
+
         var compilationTasks = solution.CurrentSolution.Projects.Select(p => p.GetCompilationAsync(cancellationToken));
         var compilations = await Task.WhenAll(compilationTasks);
-        
+
         List<Diagnostic> diagnostics = [];
         foreach (var compilation in compilations.Where(x => x != null).Cast<Compilation>())
         {
